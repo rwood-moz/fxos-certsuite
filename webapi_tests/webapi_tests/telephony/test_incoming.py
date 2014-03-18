@@ -12,4 +12,7 @@ class TestIncomingCall(MinimalTestCase, TelephonyTestCommon):
     def test_incoming_call(self):
         self.user_guided_incoming_call()
 
-        # work in progress: verify the other message fields
+        # wip: verify the other call fields
+
+        # hang-up the call via the webapi and verify
+        self.hangup_active_call()
