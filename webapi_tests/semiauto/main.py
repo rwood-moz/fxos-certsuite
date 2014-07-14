@@ -4,22 +4,30 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this file,
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import socket
 import sys
 import unittest
 
-import environment
-import runner
+from mozlog.structured import formatters, handlers, structuredlog
+from moztest.adapters.unit import StructuredTestRunner
+
+from webapi_tests.semiauto import environment, runner, server
+
+
+__all__ = ["run", "main"]
 
 
 test_loader = None
 
 
-def _install_test_event_hooks(test_runner, handler):
-    state_updater = runner.TestStateUpdater(handler)
-    test_runner.resultclass.add_callback(state_updater)
+def create_logger():
+    logger = structuredlog.StructuredLogger("unknown")
+    logger.add_handler(
+        handlers.StreamHandler(sys.stdout, formatters.JSONFormatter()))
+    return logger
 
 
-def run(suite, spawn_browser=True, verbosity=1, quiet=False,
+def run(suite, logger=None, spawn_browser=True, verbosity=1, quiet=False,
         failfast=False, catch_break=False, buffer=True, **kwargs):
     """A simple test runner.
 
@@ -44,51 +52,36 @@ def run(suite, spawn_browser=True, verbosity=1, quiet=False,
         import unittest.signals
         unittest.signals.installHandler()
 
-    test_runner = runner.PreInstantiatedTestRunner(verbosity=verbosity,
-                                                   failfast=failfast,
-                                                   buffer=buffer,
-                                                   **kwargs)
+    if not logger:
+        logger = create_logger()
 
-    delegator = runner.TestEventDelegator(
-        test_runner.stream, test_runner.descriptions, test_runner.verbosity)
-    test_runner.resultclass = delegator
-
-    # Start new test environment, because first environment.get does
-    # that for us the first time.
-    #
-    # This is a hack and shouldn't be here.  The reason it is is
-    # because unittest doesn't allow us to modify the runner in a
-    # TestCase's setUp.
-    #
-    # Generally a lot of this code should live in TestCase.setUp.
     env = environment.get(environment.InProcessTestEnvironment,
+                          addr=None if spawn_browser else ("127.0.0.1", 6666),
                           verbose=(verbosity > 1))
 
-    # TODO(ato): Only spawn a browser when asked to.
+    url = "http://%s:%d/" % (env.server.addr[0], env.server.addr[1])
     if spawn_browser:
         import webbrowser
-        webbrowser.open("http://localhost:6666/")
+        webbrowser.open(url)
     else:
-        print("Please connect your browser to http://%s:%d/" %
-              (env.server.addr[0], env.server.addr[1]))
+        print >> sys.stderr, "Please connect your browser to %s" % url
 
-    # Get a reference to the WebSocket handler that we can use to
-    # communicate with the client browser.  This blocks until a client
-    # connects.
-    from semiauto import server
-    # A timeout is needed because of http://bugs.python.org/issue1360
-    handler = server.clients.get(block=True, timeout=sys.maxint)
+    # Wait for browser to connect and get socket connection to client
+    try:
+        so = server.wait_for_client()
+    except server.ConnectError as e:
+        print >> sys.stderr, "%s: error: %s" % (sys.argv[0], e)
+        sys.exit(1)
 
-    # Send list of tests to client.
-    test_list = runner.serialize_suite(suite)
-    handler.emit("testList", test_list)
+    tests = runner.serialize_suite(suite)
+    test_runner = StructuredTestRunner(logger=logger, test_list=tests)
 
-    handler.suite = suite
-    environment.env.handler = handler
+    # This is a hack to make the test suite metadata and the handler
+    # available to the tests.
+    so.suite = suite
+    environment.env.handler = so
 
-    # Due to extent of how much unittest sucks, this is unfortunately
-    # necessary:
-    _install_test_event_hooks(test_runner, handler)
+    logger.add_handler(runner.WSHandler(so))
 
     try:
         results = test_runner.run(suite)
@@ -99,9 +92,8 @@ def run(suite, spawn_browser=True, verbosity=1, quiet=False,
 
 
 def main(argv):
-    config = {}
-    from semiauto.loader import TestLoader
-    test_loader = TestLoader(config=config)
+    from webapi_tests.semiauto.loader import TestLoader
+    test_loader = TestLoader()
     prog = "python -m semiauto"
     indent = " " * len(prog)
     usage = """\
@@ -122,8 +114,7 @@ tests in the current working directory (".").\
     parser.add_option("-n", "--no-browser", action="store_true",
                       dest="no_browser", default=False, help="Don't "
                       "start a browser but wait for manual connection")
-    parser.add_option("-v", "--verbose", action="store_true",
-                      dest="verbose", default=False,
+    parser.add_option("-v", action="store_true", dest="verbose", default=False,
                       help="Verbose output")
     parser.add_option("-q", "--quiet", action="store_true",
                       dest="quiet", help="Minimal output")
@@ -135,8 +126,6 @@ tests in the current working directory (".").\
                       help="Buffer stdout and stderr during test runs")
     parser.add_option("--pattern", "-p", dest="pattern",
                       help='Pattern to match tests ("test_*.py" default)')
-    parser.add_option("--reuse-browser", dest="reuse_browser",
-                      help="Reuse an existing browser session.")
 
     opts, args = parser.parse_args(argv[1:])
     tests = []

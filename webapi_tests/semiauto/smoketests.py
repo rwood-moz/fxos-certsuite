@@ -4,7 +4,7 @@
 
 import unittest
 
-from semiauto import TestCase
+from webapi_tests.semiauto import TestCase
 
 
 class Smoketests(TestCase):
@@ -23,13 +23,31 @@ class Smoketests(TestCase):
     def test_instruct(self):
         self.instruct("Click OK")
 
-    @unittest.expectedFailure
     def test_instruct_cancel(self):
-        self.instruct("Click cancel")
+        with self.assertRaises(Exception):
+            self.instruct("Click cancel")
 
     def test_confirm(self):
         self.confirm("Click Yes")
 
-    @unittest.expectedFailure
     def test_confirm_no(self):
-        self.confirm("Click No")
+        with self.assertRaises(Exception):
+            self.confirm("Click No")
+
+    def test_long_response(self):
+        msg = "o" * 200
+        resp = self.prompt(
+            "Copy this exact string into the text field below: \"%s\"" % msg)
+        self.assertEqual(resp, msg)
+
+    @unittest.expectedFailure
+    def test_expected_failure(self):
+        self.instruct("Click cancel")
+
+    @unittest.expectedFailure
+    def test_unexpected_success(self):
+        self.instruct("Click OK")
+
+    @unittest.skip("This test should be marked as skipped.")
+    def test_skip(self):
+        pass

@@ -9,15 +9,17 @@ import StringIO
 import argparse
 import json
 import logging
-from marionette import Marionette
+import marionette
 import mozdevice
 import moznetwork
 import os
 import pkg_resources
+import re
 import sys
+import time
 import wptserve
 from zipfile import ZipFile
-from fxos_appgen import install_app
+import fxos_appgen
 
 from mozlog.structured import (
     commandline,
@@ -26,7 +28,7 @@ from mozlog.structured import (
     structuredlog,
 )
 from omni_analyzer import OmniAnalyzer
-from wait import Wait
+import wait
 
 """Signalizes whether client has made initial connection to HTTP
 server.
@@ -42,66 +44,36 @@ headers = None
 installed = False
 
 webapi_results = None
-webapi_results_priv = None
-webapi_results_cert = None
+webapi_results_embed_app = None
 
 supported_versions = ["1.4", "1.3"]
 
 @wptserve.handlers.handler
-def connect_handler(request, response):
-    response.headers.set("Content-Type", "text/html")
-    response.content = "<head><meta charset=utf-8 name=\"viewport\" content=\"width=device-width\"></head>" \
-                       "<p><a href='/headers'><h1>Click me</h1></a></p>"
-
-    global connected
-    connected = True
-
-@wptserve.handlers.handler
-def headers_handler(request, response):
-    response.headers.set("Content-Type", "text/html")
-    response.content = "<head><meta charset=utf-8 name=\"viewport\" content=\"width=device-width\"></head>" \
-                       "<p><a href='/install.html'><h1>Click me to go to the app install page<h1></a></p>"
-
+def webapi_results_handler(request, response):
     global headers
     headers = request.headers
 
-@wptserve.handlers.handler
-def installed_handler(request, response):
-    global installed
-    installed = True
-
-@wptserve.handlers.handler
-def webapi_results_handler(request, response):
     global webapi_results
     webapi_results = json.loads(request.POST["results"])
 
 @wptserve.handlers.handler
-def webapi_results_priv_handler(request, response):
-    global webapi_results_priv
-    webapi_results_priv = json.loads(request.POST["results"])
+def webapi_results_embed_apps_handler(request, response):
+    global webapi_results_embed_app
+    webapi_results_embed_app = json.loads(request.POST["results"])
 
-@wptserve.handlers.handler
-def webapi_results_cert_handler(request, response):
-    global webapi_results_cert
-    webapi_results_cert = json.loads(request.POST["results"])
+routes = [("POST", "/webapi_results", webapi_results_handler),
+          ("POST", "/webapi_results_embed_apps", webapi_results_embed_apps_handler),
+          ("GET", "/*", wptserve.handlers.file_handler)]
 
 static_path = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "static"))
-
-routes = [("GET", "/", connect_handler),
-          ("GET", "/headers", headers_handler),
-          ("GET", "/installed", installed_handler),
-          ("POST", "/webapi_results", webapi_results_handler),
-          ("POST", "/webapi_results_priv", webapi_results_priv_handler),
-          ("POST", "/webapi_results_cert", webapi_results_cert_handler),
-          ("GET", "/*", wptserve.handlers.file_handler)]
 
 def read_manifest(app):
     with open(os.path.join(app, 'manifest.webapp')) as f:
         manifest = f.read()
     return manifest
 
-def package_app(path, extrafiles):
+def package_app(path, extrafiles={}):
     app_path = 'app.zip'
     with ZipFile(app_path, 'w') as zip_file:
         for root, dirs, files in os.walk(path):
@@ -112,114 +84,142 @@ def package_app(path, extrafiles):
         for f in extrafiles:
             zip_file.writestr(f, extrafiles[f])
 
-# TODO: This local version of install_app can be removed as soon as
-# the version of fxos-appgen on PyPI supports timeout.
-def install_app(app_name, app_path, adb_path=None, timeout=5000):
-    dm = None
-    if adb_path:
-        dm = mozdevice.DeviceManagerADB(adbPath=adb_path)
+def install_app(logger, appname, version, apptype, apppath, all_perms,
+                extrafiles, launch=False):
+
+    logger.debug('uninstalling: %s' % appname)
+    fxos_appgen.uninstall_app(appname)
+
+    logger.debug('packaging: %s version: %s apptype: %s all_perms: %s' %
+        (appname, version, apptype, all_perms))
+
+    details = fxos_appgen.create_details(version, all_perms=all_perms)
+    manifest = json.dumps(fxos_appgen.create_manifest(appname, details, apptype, version))
+    files = extrafiles.copy()
+    files['manifest.webapp'] = manifest
+    package_app(apppath, files)
+
+    logger.debug('installing: %s' % appname)
+    fxos_appgen.install_app(appname, 'app.zip', script_timeout=30000)
+    if launch:
+        logger.debug('launching: %s' % appname)
+        fxos_appgen.launch_app(appname)
+
+def test_user_agent(user_agent, logger):
+    # See https://developer.mozilla.org/en-US/docs/Gecko_user_agent_string_reference#Firefox_OS
+    # and https://wiki.mozilla.org/B2G/User_Agent/Device_Model_Inclusion_Requirements
+    ua_rexp = re.compile("Mozilla/(\d+\.\d+) \((Mobile|Tablet)(;.*)?; rv:(\d+\.\d+)\) Gecko/(\d+\.\d+) Firefox/(\d+\.\d+)")
+
+    m = ua_rexp.match(user_agent)
+
+    valid = True
+
+    if m is None or len(m.groups()) != 6:
+        # no match
+        valid = False
+        message = 'Did not match regular expression'
+    elif m.groups()[2] != None:
+        # Specified a device string, strip leading ';' and any leading/trailing whitespace
+        device = m.groups()[2][1:].strip()
+        # Do not use slash ("/"), semicolon (";"), round brackets or any whitespace.
+        device_rexp = re.compile('[/;\(\)\s]')
+        m = device_rexp.search(device)
+        if m:
+            valid = False
+            message = 'Device identifier: "%s" contains forbidden characters' % device
+
+    if valid:
+        logger.test_status('webapi', 'user-agent-string', 'PASS')
     else:
-        dm = mozdevice.DeviceManagerADB()
+        logger.test_status('webapi', 'user-agent-string', 'FAIL', 'Invalid user-agent string: %s: %s' % (user_agent, message))
 
-    #TODO: replace with app name
-    installed_app_name = app_name.lower()
-    installed_app_name = installed_app_name.replace(" ", "-")
-    if dm.dirExists("/data/local/webapps/%s" % installed_app_name):
-        raise Exception("%s is already installed" % app_name)
-        sys.exit(1)
-    app_zip = os.path.basename(app_path)
-    dm.pushFile("%s" % app_path, "/data/local/%s" % app_zip)
-    # forward the marionette port
-    ret = dm.forward("tcp:2828", "tcp:2828")
-    if ret != 0:
-        raise Exception("Can't use localhost:2828 for port forwarding." \
-                        "Is something else using port 2828?")
+    return valid
 
-    # install the app
-    install_js = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                              "app_install.js"))
-    f = open(install_js, "r")
-    script = f.read()
-    f.close()
-    script = script.replace("YOURAPPID", installed_app_name)
-    script = script.replace("YOURAPPZIP", app_zip)
-    m = Marionette()
-    m.start_session()
-    m.set_context("chrome")
-    m.set_script_timeout(timeout)
-    m.execute_async_script(script)
-    m.delete_session()
+def test_open_remote_window(logger, version, addr):
+    global webapi_results
 
-def diff_results(a, b, checkNull):
+    results = {}
+    for value in ['deny', 'allow']:
+        result = False
+        webapi_results = None
+
+        appname = 'Open Remote Window Test App'
+        installed_appname = appname.lower().replace(" ", "-")
+        apppath = os.path.join(static_path, 'open-remote-window-test-app')
+        install_app(logger, appname, version, 'web', apppath, False,
+            {'results_uri.js':
+                'RESULTS_URI="http://%s:%s/webapi_results";' % addr})
+
+        set_permission('open-remote-window', value, installed_appname)
+        fxos_appgen.launch_app(appname)
+        try:
+            wait.Wait(timeout=30).until(lambda: webapi_results is not None)
+        except wait.TimeoutException:
+            # This does not necessarily indicate a problem, if the other window
+            # launched remotely, our original test app may stop before it POSTs
+            pass
+
+        if webapi_results is not None:
+            result = webapi_results['open-remote-window']
+
+        running_apps = get_runningapps()
+        for app in running_apps:
+            if app == 'window:Remote Window,source:app://' + installed_appname:
+                result = True
+                kill(app)
+
+        # We uninstall rather than using kill() as kill seems unhappy when
+        # the popup is open.
+        logger.debug('uninstalling: %s' % appname)
+        fxos_appgen.uninstall_app(appname)
+
+        results['open-remote-window-' + value] = result
+
+    return results
+
+def diff_results(a, b):
 
     a_set = set(a.keys())
     b_set = set(b.keys())
 
-    if checkNull:
-        a_nullset = set([key for key in a.keys() if a[key] is None])
-        b_nullset = set([key for key in b.keys() if b[key] is None])
-        result = list(b_nullset.difference(a_nullset))
-    else:
-        result = list(b_set.difference(a_set))
+    result = list(b_set.difference(a_set))
 
     same_keys = a_set.intersection(b_set)
     for key in same_keys:
         if type(a[key]) is dict:
             if type(b[key]) is not dict:
-                result.extend(key)
+                result.append(key)
             else:
-                result.extend([key + '.' + item for item in diff_results(a[key], b[key], checkNull)])
+                result.extend([key + '.' + item for item in diff_results(a[key], b[key])])
+        elif a[key] != b[key]:
+            result.append(key)
 
     return result
 
-def log_results(diff, logger, report, name):
+def log_results(diff, logger, report, test_group, name):
     if diff:
         report[name.replace('-', '_')] = diff
-        try:
-            logger.test_status('webapi', name, 'FAIL', message=','.join([result['name'] for result in diff]))
-        except TypeError:
-            logger.test_status('webapi', name, 'FAIL', message=','.join(diff))
+        for result in diff:
+            try:
+                logger.test_status(test_group, name, 'FAIL', message='Unexpected result for: %s' % result['name'])
+            except TypeError:
+                logger.test_status(test_group, name, 'FAIL', message='Unexpected result for: %s' % result)
     else:
-        logger.test_status('webapi', name, 'PASS')
+        logger.test_status(test_group, name, 'PASS')
 
-def parse_results(expected_results_path, results, prefix, logger, report):
-    expected_results = json.loads(open(expected_results_path, 'r').read())
-    #compute difference in navigator functions
-    expected_nav = expected_results["navList"]
-    nav = results["navList"]
+def parse_webapi_results(expected_results_path, results, prefix, logger, report):
+    with open(expected_results_path) as f:
+        expected_results = json.load(f)
 
-    logger.test_start('webapi')
-    webapi_passed = True
-
-    missing_nav = diff_results(expected_nav, nav, False)
-    log_results(missing_nav, logger, report, prefix + 'missing-navigator-functions')
-
-    added_nav = diff_results(nav, expected_nav, False)
-    log_results(added_nav, logger, report, prefix + 'added-navigator-functions')
-    if missing_nav or added_nav:
-        webapi_passed = False
-
-    # NOTE: privileged functions in an unprivileged app are null
-    # compute difference in navigator "null" functions, ie: privileged functions
-    missing_nav_null = diff_results(expected_nav, nav, True)
-    log_results(missing_nav_null, logger, report, prefix + 'missing-navigator-unprivileged-functions')
-
-    added_nav_null = diff_results(nav, expected_nav, True)
-    log_results(added_nav_null, logger, report, prefix + 'added-navigator-unprivileged-functions')
-    if missing_nav_null or added_nav_null:
-        webapi_passed = False
-
-    #computer difference in window functions
+    #compute difference in window functions
     expected_window = expected_results["windowList"]
     window = results["windowList"]
 
-    missing_window = diff_results(expected_window, window, False)
-    log_results(missing_window, logger, report, prefix + 'missing-window-functions')
+    missing_window = diff_results(expected_window, window)
+    log_results(missing_window, logger, report, 'webapi', prefix + 'missing-window-functions')
 
-    added_window = diff_results(window, expected_window, False)
-    log_results(added_window, logger, report, prefix + 'added-window-functions')
-    if missing_window or added_window:
-        webapi_passed = False
+    added_window = diff_results(window, expected_window)
+    log_results(added_window, logger, report, 'webapi', prefix + 'added-window-functions')
 
     # compute differences in WebIDL results
     expected_webidl = {}
@@ -239,20 +239,120 @@ def parse_results(expected_results_path, results, prefix, logger, report):
     # since we delete found results above, anything here is missing
     missing_webidl_results = list(expected_webidl.values())
 
-    log_results(unexpected_webidl_results, logger, report, prefix + 'unexpected-webidl-results')
-    log_results(added_webidl_results, logger, report, prefix + 'added-webidl-results')
-    log_results(missing_webidl_results, logger, report, prefix + 'missing-webidl-results')
-    if added_webidl_results or unexpected_webidl_results or missing_webidl_results:
-        webapi_passed = False
+    log_results(unexpected_webidl_results, logger, report, 'webapi', prefix + 'unexpected-webidl-results')
+    log_results(added_webidl_results, logger, report, 'webapi', prefix + 'added-webidl-results')
+    log_results(missing_webidl_results, logger, report, 'webapi', prefix + 'missing-webidl-results')
 
-    return webapi_passed
+def parse_permissions_results(expected_results_path, results, prefix, logger, report):
+    with open(expected_results_path) as f:
+        expected_results = json.load(f)
 
+    # compute differences in permissions results
+    unexpected_results = diff_results(expected_results, results)
+    log_results(unexpected_results, logger, report, 'permissions', prefix + 'unexpected-permissions-results')
+    return not unexpected_results
+
+def run_marionette_script(script, chrome=False, async=False):
+    """Create a Marionette instance and run the provided script"""
+    m = marionette.Marionette()
+    m.start_session()
+    if chrome:
+        m.set_context(marionette.Marionette.CONTEXT_CHROME)
+    if not async:
+        result = m.execute_script(script)
+    else:
+        result = m.execute_async_script(script)
+    m.delete_session()
+    return result
+
+def kill(name):
+    """Kill the specified app"""
+    script = """
+      let manager = window.wrappedJSObject.AppWindowManager || window.wrappedJSObject.WindowManager;
+      manager.kill('%s');
+    """
+    return run_marionette_script(script % name)
+
+def get_permission(permission, app):
+    # The object created to wrap PermissionSettingsModule is to work around
+    # an intermittent bug where it will sometimes be undefined.
+    script = """
+      const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+      var a = {b: Cu.import("resource://gre/modules/PermissionSettings.jsm")};
+
+      return a.b.PermissionSettingsModule.getPermission('%s', '%s/manifest.webapp', '%s', '', false);
+    """
+    app_url = 'app://' + app
+    return run_marionette_script(script % (permission, app_url, app_url), True)
+
+def get_permissions():
+    """Return permissions in PermissionsTable.jsm"""
+    script = """
+      const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+      Cu.import("resource://gre/modules/PermissionsTable.jsm");
+
+      result = []
+      for (permission in PermissionsTable) {
+        result.push(permission);
+      }
+
+      return result;
+    """
+    return run_marionette_script(script, True)
+
+def get_runningapps():
+    """Return names of running apps"""
+
+    script = """
+      let manager = window.wrappedJSObject.AppWindowManager || window.wrappedJSObject.WindowManager;
+      let runningApps = manager.getRunningApps();
+
+      result = []
+      for (key in runningApps) {
+        result.push(key);
+      }
+      return result;
+    """
+    return run_marionette_script(script)
+
+def set_permission(permission, value, app):
+    """Set a permission for the specified app
+       Value should be 'deny' or 'allow'
+    """
+    # The object created to wrap PermissionSettingsModule is to work around
+    # an intermittent bug where it will sometimes be undefined.
+    script = """
+      const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+      var a = {b: Cu.import("resource://gre/modules/PermissionSettings.jsm")};
+      return a.b.PermissionSettingsModule.addPermission({
+        type: '%s',
+        origin: '%s',
+        manifestURL: '%s/manifest.webapp',
+        value: '%s',
+        browserFlag: false
+      });
+    """
+    app_url = 'app://' + app
+    run_marionette_script(script % (permission, app_url, app_url, value), True)
+
+def set_preference(pref, value):
+    script = """
+      var lock = navigator.mozSettings.createLock();
+      var result = lock.set({'%s': %s});
+      result.onsuccess = function() {
+        marionetteScriptFinished(true);
+      };
+      result.onerror= function() {
+        marionetteScriptFinished(false);
+      };
+    """
+    return run_marionette_script(script % (pref, value), False, True)
 
 def cli():
+    global webapi_results
+    global webapi_results_embed_app
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--no-reboot",
-                        help="don't reboot device before running test",
-                        action="store_true")
     parser.add_argument("--version",
                         help="version of FxOS under test",
                         default="1.3",
@@ -280,6 +380,7 @@ def cli():
 
     test_groups = [
         'omni-analyzer',
+        'permissions',
         'webapi',
         ]
     if args.list_test_groups:
@@ -306,15 +407,49 @@ def cli():
         logger.error("Error connecting to device: %s" % e.msg)
         sys.exit(1)
 
-    # Reboot phone so it is in a fresh state
-    if not args.no_reboot:
-        print "Rebooting device..."
-        dm.reboot(wait=True)
+    # wait here to make sure marionette is running
+    logger.debug('Attempting to set up port forwarding for marionette')
+    if dm.forward("tcp:2828", "tcp:2828") != 0:
+        raise Exception("Can't use localhost:2828 for port forwarding." \
+                        "Is something else using port 2828?")
+    retries = 0
+    while retries < 5:
+        try:
+            m = marionette.Marionette()
+            m.start_session()
+            m.delete_session()
+            break
+        except (IOError, TypeError):
+            time.sleep(5)
+            retries += 1
+    else:
+        raise Exception("Couldn't connect to marionette after %d attempts. " \
+        "Is the marionette extension installed?" % retries)
 
     if args.version not in supported_versions:
         print "%s is not a valid version. Please enter one of %s" % \
               (args.version, supported_versions)
         sys.exit(1)
+
+    result_file_path = args.result_file
+    if not result_file_path:
+        result_file_path = "results.json"
+
+    # Make sure we can write to the results file before running tests.
+    # This will also ensure this file exists in case we error out later on.
+    try:
+        result_file = open(result_file_path, "w")
+        result_file.close()
+    except IOError as e:
+        print 'Could not open result file for writing: %s errno: %d' % (result_file_path, e.errno)
+        sys.exit(1)
+
+    # We need to disable the lockscreen and screen timeout to get consistent
+    # results. The metaharness will reset these values for us.
+    if not (set_preference('screen.timeout', 0) or
+            set_preference('lockscreen.enabled', 'false')):
+        logger.error('Could not disable timeout and/or lockscreen. '
+                     'Expect test timeouts')
 
     # get build properties
     buildpropoutput = dm.shellCheckOutput(["cat", "/system/build.prop"])
@@ -339,6 +474,7 @@ def cli():
     for section in config.sections():
         report['application_ini'][section] = dict(config.items(section))
 
+    logger.suite_start(tests=[])
     # run the omni.ja analyzer
     if 'omni-analyzer' in test_groups:
         omni_results_path = pkg_resources.resource_filename(
@@ -353,99 +489,190 @@ def cli():
         if not args.generate_reference:
             os.remove(omni_results_path)
 
-    # Step 2: Navigate to local hosted web server to install app for
-    # WebIDL iteration and fetching HTTP headers
-    if 'webapi' in test_groups:
-        addr = (moznetwork.get_ip(), 8080)
+    # start webserver
+    if 'webapi' in test_groups or 'permissions' in test_groups:
         httpd = wptserve.server.WebTestHttpd(
-            host=addr[0], port=addr[1], routes=routes, doc_root=static_path)
+            host=moznetwork.get_ip(), port=8000, routes=routes, doc_root=static_path)
         httpd.start()
+        addr = (httpd.host, httpd.port)
 
-        print "\n#1: On your phone, please launch the browser app and navigate to "\
-            "http://%s:%d/" % (httpd.host, httpd.port)
-        Wait(timeout=600).until(lambda: connected is True)
+    # run webapi and webidl tests
+    if 'webapi' in test_groups:
+        errors = False
 
-        print "\n#2: On the web page that's loaded, please click the 'Click me' link"
-        Wait().until(lambda: headers is not None)
-        report["headers"] = headers
+        logger.test_start('webapi')
+        logger.debug('Running webapi verifier tests')
 
-        print "\n#3: Next, click the link which reads 'Click me to go to the app " \
-            "install page', then click the button which appears to install the test app"
-        Wait().until(lambda: installed is True)
+        for apptype in ['web', 'privileged', 'certified']:
+            global webapi_results
 
-        print "\n#4: Please follow the instructions to install the app, then launch " \
-            "WebAPI Verifier from the homescreen. This will start the WebAPI tests " \
-            "and may take a couple minutes to complete."
-        Wait(timeout=600).until(lambda: webapi_results is not None)
+            webapi_results = None
 
+            appname = '%s WebAPI Verifier' % apptype.capitalize()
+            apppath = os.path.join(static_path, 'webapi-test-app')
+            install_app(logger, appname, args.version, apptype, apppath, True,
+                        {'results_uri.js':
+                            'RESULTS_URI="http://%s:%s/webapi_results";' % addr},
+                        True)
+
+            try:
+                wait.Wait(timeout=120).until(lambda: webapi_results is not None)
+            except wait.TimeoutException:
+                logger.error('Timed out waiting for results')
+                errors = True
+
+            logger.debug('uninstalling: %s' % appname)
+            fxos_appgen.uninstall_app(appname)
+
+            if webapi_results is None:
+                continue
+
+            if "headers" not in report:
+                report["headers"] = headers
+                test_user_agent(headers['user-agent'], logger)
+
+            results_filename = '%s.%s.json' % (args.version, apptype)
+            if args.generate_reference:
+                with open(results_filename, 'w') as f:
+                    f.write(json.dumps(webapi_results, sort_keys=True, indent=2))
+            else:
+                file_path = pkg_resources.resource_filename(
+                                __name__, os.path.sep.join(['expected_webapi_results', results_filename]))
+
+                parse_webapi_results(file_path, webapi_results, '%s-' % apptype, logger, report)
+
+        logger.debug('Done.')
+        if errors:
+            logger.test_end('webapi', 'ERROR')
+        else:
+            logger.test_end('webapi', 'OK')
+
+    if 'permissions' in test_groups:
+        errors = False
+
+        logger.test_start('permissions')
+        logger.debug('Running permissions tests')
+
+        permissions = get_permissions()
+
+        # test default permissions
+        for apptype in ['web', 'privileged', 'certified']:
+            results = {}
+            expected_webapi_results = None
+
+            appname = 'Default Permissions Test App'
+            fxos_appgen.uninstall_app(appname)
+            installed_appname = appname.lower().replace(" ", "-")
+            fxos_appgen.generate_app(appname, install=True, app_type=apptype,
+                                     all_perm=True)
+
+            for permission in permissions:
+                result = get_permission(permission, installed_appname)
+                results[permission] = result
+
+            results_filename = '%s.%s.json' % (args.version, apptype)
+            if args.generate_reference:
+                with open(results_filename, 'w') as f:
+                    f.write(json.dumps(results, sort_keys=True, indent=2))
+            else:
+                file_path = pkg_resources.resource_filename(__name__,
+                            os.path.sep.join(['expected_permissions_results',
+                            results_filename]))
+                parse_permissions_results(file_path, results, '%s-' % apptype,
+                    logger, report)
+
+            fxos_appgen.uninstall_app(appname)
+
+        # test individual permissions
+        results = {}
+
+        # first install test app for embed-apps permission test
+        embed_appname = 'Embed Apps Test App'
+        apppath = os.path.join(static_path, 'embed-apps-test-app')
+        install_app(logger, embed_appname, args.version, 'certified', apppath, True,
+                    {'results_uri.js': 'RESULTS_URI="http://%s:%s/webapi_results_embed_apps";' % addr},
+                     False)
+
+
+
+        appname = 'Permissions Test App'
+        installed_appname = appname.lower().replace(" ", "-")
+        apppath = os.path.join(static_path, 'permissions-test-app')
+        install_app(logger, appname, args.version, 'web', apppath, False,
+                {'results_uri.js':
+                    'RESULTS_URI="http://%s:%s/webapi_results";' % addr})
+
+        for permission in [None] + permissions:
+            webapi_results = None
+            webapi_results_embed_app = None
+
+            # if we try to launch after killing too quickly, the app seems
+            # to not fully launch
+            time.sleep(5)
+
+            if permission is not None:
+                logger.debug('testing permission: %s' % permission)
+                set_permission(permission, u'allow', installed_appname)
+            fxos_appgen.launch_app(appname)
+
+            try:
+                wait.Wait(timeout=60).until(lambda: webapi_results is not None)
+
+                # embed-apps results are posted to a separate URL
+                if webapi_results_embed_app:
+                    webapi_results['embed-apps'] = webapi_results_embed_app['embed-apps']
+                else:
+                    webapi_results['embed-apps'] = False
+
+                if permission is None:
+                    expected_webapi_results = webapi_results
+                else:
+                    results[permission] = diff_results(expected_webapi_results, webapi_results)
+            except wait.TimeoutException:
+                logger.error('Timed out waiting for results')
+                results[permission] = 'timed out'
+                errors = True
+
+            kill('app://' + installed_appname)
+            if permission is not None:
+                set_permission(permission, u'deny', installed_appname)
+
+        logger.debug('uninstalling: %s' % appname)
+        fxos_appgen.uninstall_app(appname)
+
+        # we test open-remote-window separately as opening a remote
+        # window might stop the test app
+        results['open-remote-window'] = test_open_remote_window(logger,
+                                            args.version, addr)
+
+        results_filename = '%s.permissions.json' % args.version
         if args.generate_reference:
-            with open('webapi_results.json', 'w') as f:
-                f.write(json.dumps(webapi_results))
+            with open(results_filename, 'w') as f:
+                f.write(json.dumps(results, sort_keys=True, indent=2))
+        else:
+            file_path = pkg_resources.resource_filename(__name__,
+                        os.path.sep.join(['expected_permissions_results',
+                        results_filename]))
+            parse_permissions_results(file_path, results, 'individual-',
+                logger, report)
 
-        print "Processing results..."
-        file_path = pkg_resources.resource_filename(
-                            __name__, os.path.sep.join(['expected_webapi_results', '%s.json' % args.version]))
+        logger.debug('Done.')
+        if errors:
+            logger.test_end('permissions', 'ERROR')
+        else:
+            logger.test_end('permissions', 'OK')
 
-        webapi_passed = parse_results(file_path, webapi_results, 'unpriv-', logger, report)
+        # clean up embed-apps test app
+        logger.debug('uninstalling: %s' % embed_appname)
+        fxos_appgen.uninstall_app(embed_appname)
 
-        # Run privileged app
-        print "\n#5: Installing the privileged app. This will take a minute... "
+    logger.suite_end()
 
-        apppath = os.path.join(static_path, 'webapi-test-app')
-        apppath_priv = os.path.join(static_path, 'webapi-test-app-priv')
-        manifest = read_manifest(apppath_priv)
-        appname = json.loads(manifest)['name']
-        package_app(apppath, {'results_uri.js': 'RESULTS_URI="http://%s:%s/webapi_results_priv";' % addr,
-                              'manifest.webapp': manifest})
-        install_app(appname, 'app.zip', timeout=30000)
-
-        print "Done. Please run the Privileged WebAPI Verifier from the home screen."
-
-        Wait(timeout=600).until(lambda: webapi_results_priv is not None)
-
-        if args.generate_reference:
-            with open('webapi_results_priv.json', 'w') as f:
-                f.write(json.dumps(webapi_results_priv))
-
-        print "Processing results..."
-        file_path = pkg_resources.resource_filename(
-                            __name__, os.path.sep.join(['expected_webapi_results', '%s.priv.json' % args.version]))
-        webapi_passed = parse_results(file_path, webapi_results_priv, 'priv-', logger, report) and webapi_passed
-
-        # Run certified app
-        print "\n#6: Installing the certified app. This will take a minute... "
-
-        apppath = os.path.join(static_path, 'webapi-test-app')
-        apppath_cert = os.path.join(static_path, 'webapi-test-app-cert')
-        manifest = read_manifest(apppath_cert)
-        appname = json.loads(manifest)['name']
-        package_app(apppath, {'results_uri.js': 'RESULTS_URI="http://%s:%s/webapi_results_cert";' % addr,
-                              'manifest.webapp': manifest})
-        install_app(appname, 'app.zip', timeout=30000)
-        os.remove('app.zip')
-        print "Done. Please run the Certified WebAPI Verifier from the home screen."
-
-        Wait(timeout=600).until(lambda: webapi_results_cert is not None)
-
-        if args.generate_reference:
-            with open('webapi_results_cert.json', 'w') as f:
-                f.write(json.dumps(webapi_results_cert))
-
-        print "Processing results..."
-        file_path = pkg_resources.resource_filename(
-                            __name__, os.path.sep.join(['expected_webapi_results', '%s.cert.json' % args.version]))
-        webapi_passed = parse_results(file_path, webapi_results_cert, 'cert-', logger, report) and webapi_passed
-
-        logger.test_end('webapi', 'PASS' if webapi_passed else 'FAIL')
-
-    result_file_path = args.result_file
-    if not result_file_path:
-        result_file_path = "results.json"
     result_file = open(result_file_path, "w")
     result_file.write(json.dumps(report, indent=2))
     result_file.close()
 
-    print "\nResults have been stored in: %s" % result_file_path
+    logger.debug('Results have been stored in: %s' % result_file_path)
 
 if __name__ == "__main__":
     cli()

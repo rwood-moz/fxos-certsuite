@@ -1,4 +1,8 @@
-
+/*
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
 
 setup({explicit_done:true, timeout_multiplier:10});
 
@@ -7,26 +11,29 @@ function getTheNames(obj, visited)
   var orig_obj = obj;
 
   var result = {};
-  visited[obj.toString()] = result;
+  visited[obj] = result;
 
   while (obj) {
     for (var name of Object.getOwnPropertyNames(obj)) {
       try {
         var value = orig_obj[name];
-        var value_name = value.toString();
-        var type = typeof(value);
+        var value_visited = visited[value];
       } catch(err) {
+        // We can hit a few exceptions here:
+        // * some objects will throw "NS_ERROR_XPC_BAD_OP_ON_WN_PROTO: Illegal operation on WrappedNative prototype object" for the prototype property
+        // * some objects will throw "Method not implemented" or similar when trying to access them by name
         result[name] = err;
         continue;
       }
 
       if (value === null) {
         result[name] = null;
-      } else if (type === "object") {
-        if (!visited[value_name]) {
-          getTheNames(value, visited);
+      } else if (typeof value === "object") {
+        if (value_visited === undefined) {
+          result[name] = getTheNames(value, visited);
+        } else {
+          result[name] = true;
         }
-        result[name] = value_name;
       } else {
         result[name] = true;
       }
@@ -41,7 +48,9 @@ function getTheNames(obj, visited)
 function runTest()
 {
 
+  // Run WebIDL test suite
   var webIDLResults = []
+
   add_completion_callback(function (tests) {
     tests.forEach(function (test) {
       var result;
@@ -86,27 +95,16 @@ function runTest()
   idl_array.test();
   done();
 
-  var navResults = {};
-  getTheNames(navigator, navResults);
-
-  var winResults = {};
-  getTheNames(window, winResults);
+  //Recursively get property names on window object
+  var winResults = getTheNames(window, {});
 
   var results = {};
-  results.navList = navResults;
   results.windowList = winResults;
   results.webIDLResults = webIDLResults;
 
   var xmlHttp = null;
   xmlHttp = new XMLHttpRequest();
-  try {
-      // if we have a RESULTS_URI, use that, otherwise default to origin
-      console.log('>>>>>>>>>>', RESULTS_URI);
-      xmlHttp.open( "POST", RESULTS_URI, true );
-  } catch (e) {
-      console.log('>>>>>>>>>> NO RESULTS_URI');
-      xmlHttp.open( "POST", location.origin + "/webapi_results", true );
-  }
+  xmlHttp.open( "POST", RESULTS_URI, true );
   xmlHttp.setRequestHeader("Content-type", "application/x-www-form-urlencoded")
   xmlHttp.send("results=" + JSON.stringify(results));
 

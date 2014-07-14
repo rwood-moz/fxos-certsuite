@@ -2,10 +2,20 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this file,
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 
-from semiauto import TestCase
+from webapi_tests.semiauto import TestCase
 
 
 class TestDeviceOrientation(TestCase):
+    """
+    This is a test for the `Device Orientation API`_ which will:
+
+    - Setup a device orientation event listener
+    - Ask the test user to move the device into various positions
+    - Verify that the corresponding device orientation events are triggered
+
+    .. _`Device Orientation API`: https://developer.mozilla.org/en-US/docs/Web/API/Detecting_device_orientation
+    """
+
     def tearDown(self):
         clear_script = """
             window.removeEventListener("deviceorientation", window.wrappedJSObject.deviceListener);

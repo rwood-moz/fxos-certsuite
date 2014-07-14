@@ -17,18 +17,23 @@ import tornado.websocket
 
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
-timeout = 3
 logger = logging.getLogger(__name__)
 clients = Queue.Queue()
+connect_timeout = 30
 
 
 def static_path(path):
     return os.path.join(static_dir, path)
 
 
+class NoCacheStaticFileHandler(web.StaticFileHandler):
+    def set_extra_headers(self, path):
+        self.set_header("Cache-control", "no-cache")
+
+
 class FrontendServer(object):
     def __init__(self, addr, io_loop=None, verbose=False):
-        self.addr = addr
+        self._addr = addr
         self.io_loop = io_loop or IOLoop.instance()
         self.started = False
         if verbose:
@@ -37,7 +42,7 @@ class FrontendServer(object):
         self.routes = tornado.web.Application(
             [(r"/tests", TestHandler),
              (r"/", web.RedirectHandler, {"url": "/app.html"}),
-             (r"/(.*[html|css|js])$", web.StaticFileHandler,
+             (r"/(.*[html|css|js])$", NoCacheStaticFileHandler,
               {"path": static_dir})])
         self.server = tornado.httpserver.HTTPServer(
             self.routes, io_loop=self.io_loop)
@@ -45,7 +50,7 @@ class FrontendServer(object):
     def start(self):
         """Start blocking FrontendServer."""
         self.started = True
-        self.server.listen(self.addr[1])
+        self.server.listen(self._addr[1], address=self._addr[0])
         self.io_loop.start()
 
     def stop(self):
@@ -56,22 +61,15 @@ class FrontendServer(object):
     def is_alive(self):
         return self.started
 
-
-# Not currently in use, but offers a more foolproof way of emitting
-# messages to connections:
-class HandlerMixin(object):
-    handlers = []
-
-    def add(self, handler, callback):
-        self.handlers.append(callback)
-
-        # Hack:
-        global clients
-        clients.put(handler)
-
-    def emit(self, event, data):
-        for cb in self.handlers:
-            cb(event, data)
+    @property
+    def addr(self):
+	# tornado doesn't guarantee that HTTPServer.listen listens
+	# before it returns, hence leaving its _socket property
+	# unpopulated until its subprocesses have bound properly.
+        assert self.is_alive()
+        while len(self.server._sockets) == 0:
+            True
+        return self.server._sockets.itervalues().next().getsockname()
 
 
 class BlockingPromptMixin(object):
@@ -79,27 +77,27 @@ class BlockingPromptMixin(object):
         self.response = Queue.Queue()
 
     def get_response(self):
-        # TODO(ato): Use timeout from semiauto.testcase
+        # TODO(ato): Use timeout from webapi_tests.semiauto.testcase
         return self.response.get(block=True, timeout=sys.maxint)
 
     def confirmation(self, question):
-        self.emit("confirmPrompt", question)
+        self.emit({"action": "confirm_prompt", "question": question})
         resp = self.get_response()
-        return True if "confirmPromptOk" in resp else False
+        return True if "confirm_prompt_ok" in resp else False
 
-    def prompt(self, question):
-        self.emit("prompt", question)
+    def prompt(self, message):
+        self.emit({"action": "prompt", "message": message})
         resp = self.get_response()
         return resp["prompt"] if "prompt" in resp else False
 
     def instruction(self, instruction):
-        self.emit("instructPrompt", instruction)
+        self.emit({"action": "instruct_prompt", "instruction": instruction})
         resp = self.get_response()
-        return True if "instructPromptOk" in resp else False
+        return True if "instruct_prompt_ok" in resp else False
 
 
 class TestHandler(tornado.websocket.WebSocketHandler,
-                  BlockingPromptMixin, HandlerMixin):
+                  BlockingPromptMixin):
     def __init__(self, *args, **kwargs):
         super(TestHandler, self).__init__(*args, **kwargs)
         self.id = None
@@ -109,8 +107,12 @@ class TestHandler(tornado.websocket.WebSocketHandler,
     def open(self, *args):
         self.id = uuid.uuid4()
         self.stream.set_nodelay(True)
-        self.add(self, self.async_callback(self.emit))
         self.connected = True
+
+        # Hack:
+        global clients
+        clients.put(self)
+
         logger.info("Accepted new client: %s" % self)
 
     def on_close(self):
@@ -121,16 +123,10 @@ class TestHandler(tornado.websocket.WebSocketHandler,
         self.response.put({})
         logger.info("Client left: %s" % self)
 
-    def emit(self, event, data=None):
-        command = {event: data}
-        payload = json.dumps(command)
+    def emit(self, message):
+        payload = json.dumps(message)
         logger.info("Sending %s" % payload)
         self.write_message(payload)
-
-    # TODO(ato): What does this do?
-    def handle_event(self, event, data):
-        print("event: %r" % event)
-        print(" data: %s" % data)
 
     def on_message(self, payload):
         message = json.loads(payload)
@@ -139,3 +135,23 @@ class TestHandler(tornado.websocket.WebSocketHandler,
 
     def __str__(self):
         return str(self.id)
+
+
+class ConnectError(RuntimeError):
+    pass
+
+
+def wait_for_client():
+    """Wait for client to connect the host browser and return.
+
+    Gets a reference to the WebSocket handler associated with that client that
+    we can use to communicate with the browser.  This blocks until a client
+    connects, or ``server.connect_timeout`` is reached and a ``ConnectError``
+    is raised.
+
+    """
+
+    try:
+        return clients.get(block=True, timeout=connect_timeout)
+    except Queue.Empty:
+        raise ConnectError("Browser connection not made in time")

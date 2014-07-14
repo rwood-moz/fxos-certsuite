@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <!--
+      This Source Code Form is subject to the terms of the Mozilla Public
+      License, v. 2.0. If a copy of the MPL was not distributed with this file,
+      You can obtain one at http://mozilla.org/MPL/2.0/.
+    -->
+  <head>
+    <meta charset=utf-8>
+    <title></title>
+  </head>
+<body>
+<div id="status">Running tests...</div>
+  <script src="results_uri.js"></script>
+  <!-- It appears promises are only available to certified apps -->
+  <script src="promise-1.0.0.min.js"></script>
+  <script src="main.js"></script>
+  <iframe id="test-mozbrowser" src="about:blank" mozbrowser></iframe>
+  <iframe id="test-mozapp" src="app://embed-apps-test-app/embedded.html" mozbrowser mozapp="app://embed-apps-test-app/manifest.webapp"></iframe>
+</body>
+</html>

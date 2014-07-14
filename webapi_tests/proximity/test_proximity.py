@@ -2,10 +2,20 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this file,
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 
-from semiauto import TestCase
+from webapi_tests.semiauto import TestCase
 
 
 class TestProximity(TestCase):
+    """
+    This is a test for the `Proximity API`_ which will:
+
+    - Setup an event listener for the device proximity light sensor
+    - Ask the test user to place their hand near/over the device light sensor
+    - Verify a proximity event was triggered
+
+    .. _`Proximity API`: https://developer.mozilla.org/en-US/docs/Web/API/Proximity_Events
+    """
+
     def tearDown(self):
         self.marionette.execute_script("""
         window.removeEventListener('devicelight', window.wrappedJSObject.prox_function);
